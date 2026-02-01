@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import numpy as np
 import cv2
@@ -5,7 +6,17 @@ from PIL import Image
 from rust_analyzer import analyze_rust_bgr
 
 st.set_page_config(page_title="Rust Quantification", layout="wide")
-st.title("Rust Quantification (Upload Photo)")
+
+# --- Logo + title header ---
+if os.path.exists("logo.png"):
+    c1, c2 = st.columns([1, 6])
+    with c1:
+        st.image("logo.png", use_container_width=True)
+    with c2:
+        st.title("Rust Quantification (Upload Photo)")
+else:
+    st.title("Rust Quantification (Upload Photo)")
+# --- end header ---
 
 uploaded = st.file_uploader("Upload a photo (PNG/JPG)", type=["png", "jpg", "jpeg"])
 
@@ -53,3 +64,4 @@ if uploaded:
     st.image(mask, clamp=True, use_container_width=True)
 else:
     st.info("Upload a photo to calculate rust % and see the rust mask/overlay.")
+
