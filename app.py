@@ -34,10 +34,13 @@ else:
     st.title("Rust Quantification – One Report")
 
 st.caption(
-    "Upload either an Excel maintenance report (.xlsx) with embedded photos "
-    "OR a single photo. Output is ONE combined inspection report."
+    "Option A: Excel (.xlsx) with embedded photos → ONE report. "
+    "Option B: Upload one or multiple photos (PNG/JPG/JPEG) → ONE report. "
+    "PDF includes thumbnails (Original / Overlay / Mask)."
 )
 st.divider()
+
+MAX_PHOTOS_IN_PDF = 30  # hard cap as requested
 
 # ============================================================
 # Helpers
@@ -106,7 +109,8 @@ def generate_pdf_with_thumbnails(report_meta, totals, per_photo_rows, photo_pane
     story.append(Paragraph("Overlay: rust in red | Mask: white = rust", styles["Normal"]))
     story.append(Spacer(1, 10))
 
-    for i, p in enumerate(photo_panels[:30], 1):
+    capped = photo_panels[:MAX_PHOTOS_IN_PDF]
+    for i, p in enumerate(capped, 1):
         story.append(Paragraph(f"<b>{p['title']}</b>", styles["Heading3"]))
         imgs = [
             RLImage(io.BytesIO(p["orig"]), 170, 120),
@@ -125,6 +129,13 @@ def generate_pdf_with_thumbnails(report_meta, totals, per_photo_rows, photo_pane
         story.append(Spacer(1, 12))
         if i % 3 == 0:
             story.append(PageBreak())
+
+    if len(photo_panels) > MAX_PHOTOS_IN_PDF:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(
+            f"Note: PDF includes only first {MAX_PHOTOS_IN_PDF} photos (limit).",
+            styles["Italic"]
+        ))
 
     doc.build(story)
     buf.seek(0)
@@ -161,24 +172,40 @@ with st.form("inspect"):
         remarks = st.text_area("Remarks")
 
     st.info(
-        "Option A: Excel (.xlsx) with embedded photos\n"
-        "Option B: Single photo (PNG/JPG/JPEG)\n\n"
-        "Upload ONLY ONE."
+        "✅ Choose ONE option:\n\n"
+        "• Option A: Excel (.xlsx) with embedded photos\n"
+        "• Option B: Upload one OR multiple photos (PNG/JPG/JPEG)\n\n"
+        "⚠️ Do NOT use both options at the same time."
     )
 
-    excel = st.file_uploader("Option A – Excel report", ["xlsx"])
-    photo = st.file_uploader("Option B – Photo", ["png", "jpg", "jpeg"])
-    run = st.form_submit_button("Analyze")
+    excel = st.file_uploader("Option A – Excel report (.xlsx)", ["xlsx"], key="excel_upl")
+
+    st.info(
+        "📸 Option B: Upload one OR multiple photos.\n"
+        "Use Ctrl/Shift to select multiple files."
+    )
+    photos = st.file_uploader(
+        "Option B – Photo(s) (PNG/JPG/JPEG)",
+        ["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="photos_upl"
+    )
+
+    run = st.form_submit_button("Analyze (One Report)")
 
 # ============================================================
 # Analysis
 # ============================================================
 if run:
-    if not excel and not photo:
-        st.error("Upload Excel OR Photo.")
+    use_excel = excel is not None
+    use_photos = photos is not None and len(photos) > 0
+
+    if not use_excel and not use_photos:
+        st.error("Upload Excel OR at least one photo.")
         st.stop()
-    if excel and photo:
-        st.error("Upload only ONE option.")
+
+    if use_excel and use_photos:
+        st.error("Please use only ONE option: Excel OR Photo(s).")
         st.stop()
 
     rust_px_total = 0
@@ -186,15 +213,19 @@ if run:
     per_photo_rows = []
     photo_panels = []
 
-    if excel:
+    # -----------------------------
+    # Option A: Excel embedded photos
+    # -----------------------------
+    if use_excel:
         images = extract_images_from_excel(excel.getvalue())
         if not images:
-            st.error("No embedded images found.")
+            st.error("No embedded images found in Excel. Please ensure photos are inserted/embedded.")
             st.stop()
 
         for i, (sheet, img_bytes) in enumerate(images, 1):
             pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
             pct, rp, vp, mask, overlay = analyze_rust_bgr(
                 bgr,
                 exclude_dark_pixels=exclude_dark,
@@ -203,38 +234,65 @@ if run:
                 open_iters=open_iters,
                 close_iters=close_iters,
             )
-            rust_px_total += rp
-            valid_px_total += vp
-            per_photo_rows.append({"Photo": i, "Sheet": sheet, "Rust %": round(pct, 2)})
+
+            rust_px_total += int(rp)
+            valid_px_total += int(vp)
+
+            per_photo_rows.append({
+                "Photo": i,
+                "Source": f"Excel:{sheet}",
+                "Rust %": round(float(pct), 2)
+            })
 
             photo_panels.append({
-                "title": f"Photo {i} ({sheet})",
+                "title": f"Photo {i} (Excel sheet: {sheet})",
                 "orig": pil_to_png_bytes(make_thumb(pil)),
                 "overlay": pil_to_png_bytes(make_thumb(Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)))),
                 "mask": pil_to_png_bytes(make_thumb(Image.fromarray(mask).convert("RGB"))),
             })
 
+    # -----------------------------
+    # Option B: Multiple photos -> ONE report
+    # -----------------------------
     else:
-        pil = Image.open(photo).convert("RGB")
-        bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-        pct, rust_px_total, valid_px_total, mask, overlay = analyze_rust_bgr(
-            bgr,
-            exclude_dark_pixels=exclude_dark,
-            min_v_for_valid=min_v,
-            kernel_size=kernel_size,
-            open_iters=open_iters,
-            close_iters=close_iters,
-        )
-        per_photo_rows = None
-        photo_panels.append({
-            "title": "Single Photo",
-            "orig": pil_to_png_bytes(make_thumb(pil)),
-            "overlay": pil_to_png_bytes(make_thumb(Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)))),
-            "mask": pil_to_png_bytes(make_thumb(Image.fromarray(mask).convert("RGB"))),
-        })
+        # Sort by filename for consistent reporting
+        photos_sorted = sorted(photos, key=lambda f: f.name.lower())
+
+        for i, f in enumerate(photos_sorted, 1):
+            pil = Image.open(f).convert("RGB")
+            bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+            pct, rp, vp, mask, overlay = analyze_rust_bgr(
+                bgr,
+                exclude_dark_pixels=exclude_dark,
+                min_v_for_valid=min_v,
+                kernel_size=kernel_size,
+                open_iters=open_iters,
+                close_iters=close_iters,
+            )
+
+            rust_px_total += int(rp)
+            valid_px_total += int(vp)
+
+            per_photo_rows.append({
+                "Photo": i,
+                "Source": f.name,
+                "Rust %": round(float(pct), 2)
+            })
+
+            photo_panels.append({
+                "title": f"Photo {i} ({f.name})",
+                "orig": pil_to_png_bytes(make_thumb(pil)),
+                "overlay": pil_to_png_bytes(make_thumb(Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)))),
+                "mask": pil_to_png_bytes(make_thumb(Image.fromarray(mask).convert("RGB"))),
+            })
+
+    if valid_px_total <= 0:
+        st.error("Valid pixels total is 0. Please check the photos (too dark / invalid).")
+        st.stop()
 
     rust_pct_total = 100 * rust_px_total / max(valid_px_total, 1)
-    severity = get_severity(rust_pct_total, minor_thr, moderate_thr)
+    severity = get_severity(rust_pct_total, float(minor_thr), float(moderate_thr))
 
     st.success(f"TOTAL Rust: {rust_pct_total:.2f}% | Severity: {severity}")
 
@@ -242,28 +300,30 @@ if run:
         "Vessel": vessel,
         "Tank / Hold": tank,
         "Location": location,
-        "Inspection Date": insp_date,
+        "Inspection Date": str(insp_date),
         "Inspector": inspector,
         "Remarks": remarks,
+        "Input Type": "Excel (embedded photos)" if use_excel else f"Photos uploaded ({len(photos)} files)"
     }
 
     totals = {
-        "rust_pct": rust_pct_total,
+        "rust_pct": float(rust_pct_total),
         "severity": severity,
-        "rust_pixels": rust_px_total,
-        "valid_pixels": valid_px_total,
+        "rust_pixels": int(rust_px_total),
+        "valid_pixels": int(valid_px_total),
     }
 
     pdf_bytes = generate_pdf_with_thumbnails(
-        report_meta,
-        totals,
-        per_photo_rows,
-        photo_panels
+        report_meta=report_meta,
+        totals=totals,
+        per_photo_rows=per_photo_rows,
+        photo_panels=photo_panels
     )
 
+    safe_vessel = (vessel or "inspection").replace(" ", "_")
     st.download_button(
         "📄 Download Inspection Report (PDF)",
         data=pdf_bytes,
-        file_name=f"rust_report_{vessel or 'inspection'}.pdf",
+        file_name=f"rust_report_{safe_vessel}.pdf",
         mime="application/pdf"
     )
