@@ -1,9 +1,12 @@
 streamlit
 numpy
+pandas
 pillow
 opencv-python-headless
-pandas
 openpyxl
 reportlab
+python-docx
+
+
 
 
