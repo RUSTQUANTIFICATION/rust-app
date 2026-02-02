@@ -9,6 +9,8 @@ import cv2
 from PIL import Image
 import openpyxl
 
+from docx import Document  # python-docx
+
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     Image as RLImage, PageBreak
@@ -34,7 +36,7 @@ else:
     st.title("Rust Quantification – One Report")
 
 st.caption(
-    "Option A: Excel (.xlsx) with embedded photos → ONE report. "
+    "Option A: Upload Excel (.xlsx) OR Word (.docx) report with embedded photos → ONE report. "
     "Option B: Upload one or multiple photos (PNG/JPG/JPEG) → ONE report. "
     "PDF includes thumbnails (Original / Overlay / Mask)."
 )
@@ -57,7 +59,32 @@ def extract_images_from_excel(xlsx_bytes):
     out = []
     for ws in wb.worksheets:
         for img in getattr(ws, "_images", []):
-            out.append((ws.title, img._data()))
+            out.append((f"Excel:{ws.title}", img._data()))
+    return out
+
+def extract_images_from_docx(docx_bytes):
+    """
+    Extract embedded images from DOCX.
+    Returns list of (source_label, img_bytes)
+    """
+    doc = Document(io.BytesIO(docx_bytes))
+    out = []
+    seen = set()
+
+    # Inline shapes typically represent inserted images
+    for idx, shape in enumerate(doc.inline_shapes, start=1):
+        try:
+            rid = shape._inline.graphic.graphicData.pic.blipFill.blip.embed
+            part = doc.part.related_parts[rid]
+            img_bytes = part.blob
+            # avoid duplicates if Word repeats the same relationship
+            key = (rid, len(img_bytes))
+            if key not in seen:
+                seen.add(key)
+                out.append((f"DOCX:Image {idx}", img_bytes))
+        except Exception:
+            continue
+
     return out
 
 def pil_to_png_bytes(pil_img):
@@ -173,12 +200,16 @@ with st.form("inspect"):
 
     st.info(
         "✅ Choose ONE option:\n\n"
-        "• Option A: Excel (.xlsx) with embedded photos\n"
+        "• Option A: Upload Excel (.xlsx) OR Word (.docx) report with embedded photos\n"
         "• Option B: Upload one OR multiple photos (PNG/JPG/JPEG)\n\n"
         "⚠️ Do NOT use both options at the same time."
     )
 
-    excel = st.file_uploader("Option A – Excel report (.xlsx)", ["xlsx"], key="excel_upl")
+    report_file = st.file_uploader(
+        "Option A – Upload report file (.xlsx or .docx)",
+        type=["xlsx", "docx"],
+        key="report_upl"
+    )
 
     st.info(
         "📸 Option B: Upload one OR multiple photos.\n"
@@ -197,15 +228,15 @@ with st.form("inspect"):
 # Analysis
 # ============================================================
 if run:
-    use_excel = excel is not None
+    use_report = report_file is not None
     use_photos = photos is not None and len(photos) > 0
 
-    if not use_excel and not use_photos:
-        st.error("Upload Excel OR at least one photo.")
+    if not use_report and not use_photos:
+        st.error("Upload a report file (.xlsx/.docx) OR at least one photo.")
         st.stop()
 
-    if use_excel and use_photos:
-        st.error("Please use only ONE option: Excel OR Photo(s).")
+    if use_report and use_photos:
+        st.error("Please use only ONE option: report file OR photo(s).")
         st.stop()
 
     rust_px_total = 0
@@ -214,18 +245,31 @@ if run:
     photo_panels = []
 
     # -----------------------------
-    # Option A: Excel embedded photos
+    # Option A: Report file (Excel or Word)
     # -----------------------------
-    if use_excel:
-        images = extract_images_from_excel(excel.getvalue())
-        if not images:
-            st.error("No embedded images found in Excel. Please ensure photos are inserted/embedded.")
+    if use_report:
+        fname = report_file.name.lower()
+        b = report_file.getvalue()
+
+        if fname.endswith(".xlsx"):
+            extracted = extract_images_from_excel(b)
+        elif fname.endswith(".docx"):
+            extracted = extract_images_from_docx(b)
+        else:
+            st.error("Unsupported report type.")
             st.stop()
 
-        for i, (sheet, img_bytes) in enumerate(images, 1):
-            pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        if not extracted:
+            st.error("No embedded images found. Please ensure photos are inserted/embedded in the report.")
+            st.stop()
 
+        for i, (src, img_bytes) in enumerate(extracted, 1):
+            try:
+                pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            except Exception:
+                continue
+
+            bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
             pct, rp, vp, mask, overlay = analyze_rust_bgr(
                 bgr,
                 exclude_dark_pixels=exclude_dark,
@@ -240,22 +284,23 @@ if run:
 
             per_photo_rows.append({
                 "Photo": i,
-                "Source": f"Excel:{sheet}",
+                "Source": src,
                 "Rust %": round(float(pct), 2)
             })
 
             photo_panels.append({
-                "title": f"Photo {i} (Excel sheet: {sheet})",
+                "title": f"Photo {i} ({src})",
                 "orig": pil_to_png_bytes(make_thumb(pil)),
                 "overlay": pil_to_png_bytes(make_thumb(Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)))),
                 "mask": pil_to_png_bytes(make_thumb(Image.fromarray(mask).convert("RGB"))),
             })
 
+        input_type = f"Report file: {report_file.name}"
+
     # -----------------------------
     # Option B: Multiple photos -> ONE report
     # -----------------------------
     else:
-        # Sort by filename for consistent reporting
         photos_sorted = sorted(photos, key=lambda f: f.name.lower())
 
         for i, f in enumerate(photos_sorted, 1):
@@ -287,8 +332,10 @@ if run:
                 "mask": pil_to_png_bytes(make_thumb(Image.fromarray(mask).convert("RGB"))),
             })
 
+        input_type = f"Photos uploaded: {len(photos)} files"
+
     if valid_px_total <= 0:
-        st.error("Valid pixels total is 0. Please check the photos (too dark / invalid).")
+        st.error("Valid pixels total is 0. Photos may be too dark or invalid.")
         st.stop()
 
     rust_pct_total = 100 * rust_px_total / max(valid_px_total, 1)
@@ -303,7 +350,7 @@ if run:
         "Inspection Date": str(insp_date),
         "Inspector": inspector,
         "Remarks": remarks,
-        "Input Type": "Excel (embedded photos)" if use_excel else f"Photos uploaded ({len(photos)} files)"
+        "Input Type": input_type
     }
 
     totals = {
